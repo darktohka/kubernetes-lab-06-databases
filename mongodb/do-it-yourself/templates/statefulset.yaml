@@ -1,0 +1,313 @@
+# The StatefulSet is the part Kubernetes gives you; the orchestration (replica
+# set initiation, users, keyfile permissions) is what you have to add yourself.
+#
+# - serviceName points at the headless Service, so each Pod keeps the DNS name
+#   mongodb-<ordinal>.mongodb-svc.
+# - volumeClaimTemplates gives every member its own PVC. A Pod may be
+#   rescheduled, but its data volume and ordinal identity follow it.
+# - podManagementPolicy Parallel lets all three members start at once; a
+#   replica set does not need ordered startup, it needs all members resolvable.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "mongodb-manual.fullname" . }}
+  labels:
+    {{- include "mongodb-manual.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "mongodb-manual.serviceName" . }}
+  replicas: {{ .Values.replicaCount }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "mongodb-manual.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mongodb-manual.labels" . | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        # The upstream mongo image runs as UID 999. Setting it here (instead of
+        # relying on the image entrypoint, which we bypass) makes the data
+        # directory ownership predictable. The keyfile init container
+        # overrides this with UID 0 because it must chown the keyfile.
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if .Values.antiAffinity.enabled }}
+      affinity:
+        podAntiAffinity:
+          # Soft anti-affinity: spread the three members over nodes when the
+          # cluster has several, but keep working on a single-node laptop.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "mongodb-manual.selectorLabels" . | nindent 20 }}
+      {{- end }}
+      initContainers:
+        # The upstream mongo image normally chowns its data directory in an
+        # entrypoint that we bypass by running mongod directly. On a StorageClass
+        # whose volume root is owned by root (hostPath on Docker Desktop, some
+        # CSI drivers), UID 999 then cannot create files. Do the chown here,
+        # explicitly, for every cluster.
+        - name: data-permissions
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              mkdir -p /data/db
+              chown -R 999:999 /data/db
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 50m
+              memory: 64Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+        # MongoDB refuses to start if the keyfile is group/world readable.
+        # A Secret volume is mounted read-only with mode 0400 but is owned by
+        # root; UID 999 could still read it, however the file mode and owner
+        # are not what mongod expects. Copy it to a writable emptyDir and set
+        # ownership 999:999, mode 0400. This runs as root, then exits.
+        - name: keyfile-permissions
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              cp /etc/mongo-secret/keyfile /etc/mongo/keyfile
+              chown 999:999 /etc/mongo/keyfile
+              chmod 0400 /etc/mongo/keyfile
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 50m
+              memory: 64Mi
+          volumeMounts:
+            - name: keyfile-secret
+              mountPath: /etc/mongo-secret
+              readOnly: true
+            - name: keyfile
+              mountPath: /etc/mongo
+      containers:
+        - name: mongod
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - mongod
+          args:
+            - --replSet
+            - mongodb
+            - --bind_ip_all
+            - --port
+            - "27017"
+            - --keyFile
+            - /etc/mongo/keyfile
+            # Keep the cache small: the container limit is 768Mi and three
+            # members must fit in the namespace quota.
+            - --wiredTigerCacheSizeGB
+            - "0.25"
+          env:
+            # mongod itself does not read these; the probes below do. Keeping
+            # them in env avoids putting the password in the probe command
+            # line (visible in kubectl describe pod).
+            - name: MONGO_ROOT_USER
+              value: root
+            - name: MONGO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mongodb-manual.fullname" . }}-credentials
+                  key: admin-password
+          ports:
+            - name: mongodb
+              containerPort: 27017
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - >-
+                  mongosh --quiet --host 127.0.0.1 --port 27017
+                  --username "$MONGO_ROOT_USER" --password "$MONGO_ROOT_PASSWORD"
+                  --authenticationDatabase admin
+                  --eval 'db.adminCommand({ping:1}).ok' | grep -q 1
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - >-
+                  mongosh --quiet --host 127.0.0.1 --port 27017
+                  --username "$MONGO_ROOT_USER" --password "$MONGO_ROOT_PASSWORD"
+                  --authenticationDatabase admin
+                  --eval 'db.adminCommand({ping:1}).ok' | grep -q 1
+            # Databases are slow to start and a failover can make a member
+            # briefly unreachable. A generous liveness probe avoids turning a
+            # slow election into a restart loop.
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.resources.mongod | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+            - name: keyfile
+              mountPath: /etc/mongo
+              readOnly: true
+        # The ONLY sidecar that performs cluster initialization. It is a
+        # sidecar, not a Job, because the first user must be created from the
+        # Pod's loopback interface (MongoDB's localhost exception). It is
+        # present on all members because a StatefulSet has one Pod template,
+        # and sleeps on every member except mongodb-0.
+        - name: bootstrap
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - /scripts/bootstrap.sh
+          env:
+            - name: HOME
+              value: /tmp
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MONGO_REPLICA_SET
+              value: mongodb
+            - name: MONGO_ADMIN_USER
+              value: root
+            - name: MONGO_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mongodb-manual.fullname" . }}-credentials
+                  key: admin-password
+            - name: MONGO_APP_USER
+              value: app
+            - name: MONGO_APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mongodb-manual.fullname" . }}-credentials
+                  key: app-password
+            - name: MONGO_EXPORTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mongodb-manual.fullname" . }}-credentials
+                  key: exporter-password
+            - name: MONGO_DB
+              value: lab05
+          resources:
+            {{- toYaml .Values.resources.bootstrap | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: bootstrap
+              mountPath: /scripts
+              readOnly: true
+        # A concrete function: expose Prometheus metrics. This is the only
+        # other sidecar in the chart. "Helpful" extras (log shippers, ad-hoc
+        # backup agents, shells) do not belong here: they widen the Pod's
+        # privileges and can make a database failover depend on a third-party
+        # process. Metrics are read-only and failure of the exporter must not
+        # affect mongod, which is why it is a separate container.
+        - name: exporter
+          image: "{{ .Values.exporter.image.repository }}:{{ .Values.exporter.image.tag }}"
+          imagePullPolicy: {{ .Values.exporter.image.pullPolicy }}
+          args:
+            - --mongodb.uri=mongodb://127.0.0.1:27017/admin
+            - --collect-all
+            - --web.listen-address=:9216
+          env:
+            - name: MONGODB_USER
+              value: exporter
+            - name: MONGODB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mongodb-manual.fullname" . }}-credentials
+                  key: exporter-password
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.exporter.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 9216
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.exporter.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+      volumes:
+        # The emptyDir is shared by the init container and mongod for the
+        # duration of the Pod; it holds no data that must survive a restart.
+        - name: keyfile
+          emptyDir: {}
+        - name: keyfile-secret
+          secret:
+            secretName: {{ include "mongodb-manual.fullname" . }}-credentials
+            defaultMode: 0400
+            items:
+              - key: keyfile
+                path: keyfile
+                mode: 0400
+        - name: bootstrap
+          configMap:
+            name: {{ include "mongodb-manual.fullname" . }}-bootstrap
+            defaultMode: 0555
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: mongodb
+          app.kubernetes.io/instance: {{ .Release.Name }}
+          app.kubernetes.io/part-of: lab05
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

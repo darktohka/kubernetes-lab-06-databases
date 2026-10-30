@@ -1,0 +1,32 @@
+{{- $fullname := include "mongodb-manual.fullname" . -}}
+{{- $serviceName := include "mongodb-manual.serviceName" . -}}
+MongoDB replica set "{{ $fullname }}" is being installed in namespace "{{ .Release.Namespace }}".
+
+Wait for all three members to become ready (the bootstrap sidecar creates the
+replica set and the users, so this can take 30-90 seconds):
+
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }} -w
+  kubectl get pvc  -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }}
+
+Connect as the admin user (the password never appears in this output):
+
+  ADMIN_PW=$(kubectl -n {{ .Release.Namespace }} get secret {{ $fullname }}-credentials \
+    -o go-template='{{ "{{" }} index .data "admin-password" | base64decode {{ "}}" }}')
+  kubectl -n {{ .Release.Namespace }} exec -it {{ $fullname }}-0 -c mongod -- \
+    mongosh "mongodb://root:${ADMIN_PW}@127.0.0.1:27017/admin?directConnection=true"
+
+Then check the topology:
+
+  rs.status().members.map(m => ({ name: m.name, state: m.stateStr, health: m.health }))
+
+Application credentials live in the same Secret under app-password; the demo
+release "mongodb-demo" reads them from there.
+
+Inspect the bootstrap log on member 0:
+
+  kubectl logs -n {{ .Release.Namespace }} {{ $fullname }}-0 -c bootstrap
+
+Next steps:
+  * delete a member and watch it rejoin:  kubectl delete pod -n {{ .Release.Namespace }} {{ $fullname }}-1
+  * force an election:                    rs.stepDown(60)
+  * deploy the demo:                      helm install mongodb-demo use-cases/1-mongodb/mongo-demo -n {{ .Release.Namespace }} --set image.repository=docker.io/<user>/lab05

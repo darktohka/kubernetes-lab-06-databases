@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Demo</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
+  form { display: flex; gap: .5rem; }
+  input { flex: 1; padding: .5rem; }
+  button { padding: .5rem 1rem; }
+  ul { list-style: none; padding: 0; }
+  li { display: flex; justify-content: space-between; gap: 1rem; padding: .5rem 0; border-bottom: 1px solid #ddd; }
+  time { color: #666; font-size: .85rem; white-space: nowrap; }
+  #error { color: #b00; }
+</style>
+</head>
+<body>
+<form id="write">
+  <input id="value" placeholder="value" autocomplete="off" required>
+  <button>Save</button>
+</form>
+<ul id="items"></ul>
+<p id="error"></p>
+<script>
+const form = document.getElementById('write');
+const input = document.getElementById('value');
+const items = document.getElementById('items');
+const error = document.getElementById('error');
+
+async function load() {
+  error.textContent = '';
+  try {
+    const res = await fetch('/read?limit=20');
+    if (!res.ok) throw new Error((await res.json()).error || res.statusText);
+    const data = await res.json();
+    items.replaceChildren(...data.items.map((item) => {
+      const li = document.createElement('li');
+      const value = document.createElement('span');
+      value.textContent = item.value;
+      const time = document.createElement('time');
+      time.textContent = new Date(item.created_at).toLocaleString();
+      li.append(value, time);
+      return li;
+    }));
+  } catch (e) {
+    error.textContent = e.message;
+  }
+}
+
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  error.textContent = '';
+  try {
+    const res = await fetch('/write', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: input.value }),
+    });
+    if (!res.ok) throw new Error((await res.json()).error || res.statusText);
+    input.value = '';
+    await load();
+  } catch (e) {
+    error.textContent = e.message;
+  }
+});
+
+load();
+</script>
+</body>
+</html>

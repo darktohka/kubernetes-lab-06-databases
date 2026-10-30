@@ -1,0 +1,16 @@
+# A stable address in front of the demo Pods. Port 80 is what the Ingress and
+# `kubectl port-forward` use; the container listens on 8080.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-demo
+  labels:
+    app.kubernetes.io/name: postgres-demo
+    app.kubernetes.io/part-of: lab06-databases
+spec:
+  selector:
+    app.kubernetes.io/name: postgres-demo
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

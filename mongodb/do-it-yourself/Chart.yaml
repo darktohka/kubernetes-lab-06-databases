@@ -1,0 +1,11 @@
+apiVersion: v2
+name: mongodb-manual
+description: Hand-built three-member MongoDB replica set for Lab 5
+type: application
+version: 0.1.0
+appVersion: "8.0.34"
+keywords:
+  - mongodb
+  - replicaset
+  - statefulset
+  - lab05

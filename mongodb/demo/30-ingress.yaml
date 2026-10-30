@@ -1,0 +1,26 @@
+# Publish the demo at https://danimongo.sapi.click.
+#
+# Change the host to <your-username>mongo.sapi.click before applying.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mongodb-demo
+  labels:
+    app.kubernetes.io/name: mongodb-demo
+    app.kubernetes.io/part-of: lab06-databases
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: danimongo.sapi.click
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mongodb-demo
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - danimongo.sapi.click

@@ -1,0 +1,26 @@
+# Publish the demo at https://daniredis.sapi.click.
+#
+# Change the host to <your-username>redis.sapi.click before applying.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: redis-demo
+  labels:
+    app.kubernetes.io/name: redis-demo
+    app.kubernetes.io/part-of: lab06-databases
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: daniredis.sapi.click
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: redis-demo
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - daniredis.sapi.click

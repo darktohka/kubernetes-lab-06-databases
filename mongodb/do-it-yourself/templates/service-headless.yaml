@@ -1,0 +1,23 @@
+# A headless Service gives every Pod a stable DNS name
+# (mongodb-0.mongodb-svc.<namespace>.svc.cluster.local) without load balancing
+# between members. MongoDB clients need to address individual members to
+# discover the primary; a normal ClusterIP Service would hide them.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mongodb-manual.serviceName" . }}
+  labels:
+    {{- include "mongodb-manual.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  # Publish DNS for members that are not ready yet. The replica set must be
+  # able to resolve all members *before* any of them is primary, otherwise
+  # rs.initiate() can never complete on a fresh cluster.
+  publishNotReadyAddresses: true
+  ports:
+    - name: mongodb
+      port: 27017
+      targetPort: mongodb
+      protocol: TCP
+  selector:
+    {{- include "mongodb-manual.selectorLabels" . | nindent 4 }}

@@ -1,0 +1,70 @@
+# The demo application: a small FastAPI service that reads and writes notes.
+#
+# It connects to the "postgres-rw" Service, which the CloudNativePG operator
+# keeps pointed at the current primary. Kill the primary and the operator
+# promotes a replica; the Service follows it without any change here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-demo
+  labels:
+    app.kubernetes.io/name: postgres-demo
+    app.kubernetes.io/part-of: lab06-databases
+spec:
+  # Stateless: the database holds the data, the demo can be scaled freely.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres-demo
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres-demo
+        app.kubernetes.io/part-of: lab06-databases
+    spec:
+      containers:
+        - name: app
+          image: lighthouse.tohka.us/example-projects/lab6-postgres-demo:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: DB_HOST
+              value: postgres-rw
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              value: lab6
+            - name: DB_USER
+              value: app
+            # Same Secret the Cluster used for bootstrap.
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: password
+          # Readiness checks the database, so a Pod without a reachable
+          # primary gets no traffic. Liveness only checks the process: a
+          # failover must not restart the app.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

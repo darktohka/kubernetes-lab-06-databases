@@ -1,0 +1,27 @@
+# Publish the demo at https://danipostgres.sapi.click.
+#
+# Change the host to <your-username>postgres.sapi.click (the student
+# namespace). DNS and the certificate are created automatically by Traefik.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: postgres-demo
+  labels:
+    app.kubernetes.io/name: postgres-demo
+    app.kubernetes.io/part-of: lab06-databases
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: danipostgres.sapi.click
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: postgres-demo
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - danipostgres.sapi.click

@@ -1,0 +1,76 @@
+# Default values for the hand-built MongoDB replica set.
+#
+# The release name must be "mongodb": every object name used by the demo chart
+# (Secret mongodb-credentials, Service mongodb-svc, pods mongodb-0..2) is
+# derived from the release name and is part of the lab contract.
+
+# Overrides the release name when non-empty. Leave empty for the lab.
+fullnameOverride: ""
+
+# A replica set needs an odd number of voting members. The lab uses three.
+replicaCount: 3
+
+image:
+  repository: mongo
+  tag: 8.0.34
+  pullPolicy: IfNotPresent
+
+exporter:
+  image:
+    repository: percona/mongodb_exporter
+    tag: 0.49.0
+    pullPolicy: IfNotPresent
+  port: 9216
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+auth:
+  # Lab-only values. Override them with --set for anything reachable from
+  # outside your namespace, and never commit real credentials.
+  appPassword: lab05-app-password
+  adminPassword: lab05-admin-password
+  exporterPassword: lab05-exporter-password
+  # MongoDB requires a keyfile for internal replica set authentication. The
+  # value must be 6-1024 characters; a 64-character alphanumeric string is
+  # enough for the lab. It is NOT a production secret management strategy:
+  # anyone with the Secret can join the replica set.
+  keyfile: "BQpDAPrPtKLIYyiq7icB9Wq8zzVSLNQie5Y9bgL0U06b18UnvpCNzJ8UZsG8tLES"
+
+persistence:
+  # One volume per member, created by the StatefulSet volumeClaimTemplate.
+  size: 1Gi
+  # Empty means "use the cluster default StorageClass". The sapi.click
+  # workers use local-path, which is ReadWriteOnce and node-local.
+  storageClass: ""
+
+# mongod is deliberately small so three members plus the sidecars fit in the
+# 4 CPU / 8Gi request quota. Do not raise these without checking the quota.
+resources:
+  mongod:
+    requests:
+      cpu: 150m
+      memory: 256Mi
+    limits:
+      cpu: 600m
+      memory: 768Mi
+  bootstrap:
+    # mongosh is a Node.js program: 64Mi is not enough and the sidecar gets
+    # OOMKilled while it waits for the replica set. 256Mi is comfortable.
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 256Mi
+
+# Soft anti-affinity: spread members over nodes when the cluster has more than
+# one, but still schedule on a single-node Docker Desktop cluster.
+antiAffinity:
+  enabled: true
+
+terminationGracePeriodSeconds: 30

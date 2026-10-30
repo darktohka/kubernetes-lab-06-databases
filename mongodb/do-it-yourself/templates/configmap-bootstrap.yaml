@@ -1,0 +1,194 @@
+{{- $fullname := include "mongodb-manual.fullname" . -}}
+{{- $serviceName := include "mongodb-manual.serviceName" . -}}
+# The bootstrap program is data, not a separate workload. It is mounted into
+# the mongodb-0 pod and run by the "bootstrap" sidecar.
+#
+# Why the script lives in a ConfigMap instead of in an initContainer command:
+# initContainers run once and must finish, while the first user creation has to
+# happen on the *primary* after the replica set is initiated. That can take
+# longer than any single command, and it must be retried after Pod restarts.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-bootstrap
+  labels:
+    {{- include "mongodb-manual.labels" . | nindent 4 }}
+data:
+  bootstrap.sh: |
+    #!/bin/bash
+    # ==========================================================================
+    # One-time replica set bootstrap for the hand-built MongoDB.
+    #
+    # This runs inside the mongod Pod and talks to 127.0.0.1. That is exactly
+    # why it cannot be a Kubernetes Job: MongoDB's localhost exception - the
+    # only way to create the very first user while no users exist - applies to
+    # connections that arrive over the Pod's own loopback interface. A Job is a
+    # different Pod, so its connection arrives over the network and MongoDB
+    # rejects it.
+    #
+    # A StatefulSet uses one Pod template for every member, so a container
+    # cannot exist only on mongodb-0. The sidecar is therefore present on all
+    # three Pods and every member except mongodb-0 sleeps immediately.
+    # ==========================================================================
+    set -uo pipefail
+
+    MONGO_PORT=27017
+    ADMIN_URI="mongodb://${MONGO_ADMIN_USER}:${MONGO_ADMIN_PASSWORD}@127.0.0.1:${MONGO_PORT}/admin?directConnection=true"
+    PRIMARY_POD="{{ $fullname }}-0"
+
+    log() { printf '%s bootstrap[%s]: %s\n' "$(date -u +%H:%M:%S)" "${POD_NAME}" "$*"; }
+
+    if [[ "${POD_NAME}" != "${PRIMARY_POD}" ]]; then
+      log "not the bootstrap member (${PRIMARY_POD}); idling"
+      exec sleep infinity
+    fi
+
+    # ping does not need authentication, so it is safe before users exist.
+    ping_ok() {
+      [[ "$(mongosh --quiet --host 127.0.0.1 --port "${MONGO_PORT}" \
+        --eval 'db.adminCommand({ping:1}).ok' 2>/dev/null | tr -d '\r' | tail -n1)" == "1" ]]
+    }
+
+    # A connection with a URI that carries credentials performs SCRAM auth
+    # before running the command, so a successful ping means the credentials
+    # are valid.
+    auth_ping_ok() {
+      [[ "$(mongosh "${ADMIN_URI}" --quiet \
+        --eval 'db.runCommand({ping:1}).ok' 2>/dev/null | tr -d '\r' | tail -n1)" == "1" ]]
+    }
+
+    is_primary() {
+      [[ "$(mongosh --quiet --host 127.0.0.1 --port "${MONGO_PORT}" \
+        --eval 'db.hello().isWritablePrimary' 2>/dev/null | tr -d '\r' | tail -n1)" == "true" ]]
+    }
+
+    wait_for() {  # wait_for <description> <seconds> <command...>
+      local what="$1" timeout="$2"
+      shift 2
+      local deadline=$((SECONDS + timeout))
+      until "$@"; do
+        if (( SECONDS >= deadline )); then
+          log "timed out after ${timeout}s waiting for ${what}"
+          return 1
+        fi
+        sleep 2
+      done
+      log "${what}: ok"
+    }
+
+    log "waiting for mongod on loopback"
+    if ! wait_for "mongod ping" 120 ping_ok; then
+      exit 1
+    fi
+
+    # Fast path after a restart: users already exist, so there is nothing to
+    # do and we must not touch rs.status() without credentials.
+    if auth_ping_ok; then
+      log "admin credentials already work; bootstrap is complete"
+      exec sleep infinity
+    fi
+
+    # With users absent, the localhost exception lets us inspect and initiate
+    # the replica set. rs.status() throws before initiation, hence the try.
+    initiated="$(mongosh --quiet --host 127.0.0.1 --port "${MONGO_PORT}" \
+      --eval 'try { rs.status().ok } catch (e) { 0 }' 2>/dev/null | tr -d '\r' | tail -n1)"
+
+    if [[ "${initiated}" != "1" ]]; then
+      log "replica set is not initiated; running rs.initiate()"
+      HOSTS=(
+{{- range $i := until 3 }}
+        "{{ $fullname }}-{{ $i }}.{{ $serviceName }}.${POD_NAMESPACE}.svc.cluster.local:27017"
+{{- end }}
+      )
+      init_js="rs.initiate({_id:\"${MONGO_REPLICA_SET}\", members:["
+      for i in "${!HOSTS[@]}"; do
+        init_js+="{_id:${i}, host:\"${HOSTS[$i]}\"},"
+      done
+      init_js+="]})"
+      mongosh --quiet --host 127.0.0.1 --port "${MONGO_PORT}" --eval "${init_js}" || {
+        log "rs.initiate returned an error (already initiated?); continuing"
+      }
+    else
+      log "replica set is already initiated"
+    fi
+
+    # Users may only be created on a writable primary. This is also where the
+    # bootstrap retries if an election happens in the middle of the process.
+    if ! wait_for "this member to become primary" 120 is_primary; then
+      log "member is not primary yet; container will restart and retry"
+      exit 1
+    fi
+
+    # A concurrent run (or a previous restart) may have finished while we
+    # waited. Check again before trying to create the first user.
+    if auth_ping_ok; then
+      log "admin credentials already work; bootstrap is complete"
+      exec sleep infinity
+    fi
+
+    # The very first user must be created without credentials, from loopback,
+    # while no users exist. This is the localhost exception.
+    log "creating the admin user over the localhost exception"
+    mongosh --quiet --host 127.0.0.1 --port "${MONGO_PORT}" --eval '
+      try {
+        db.getSiblingDB("admin").createUser({
+          user: process.env.MONGO_ADMIN_USER,
+          pwd: process.env.MONGO_ADMIN_PASSWORD,
+          roles: [{ role: "root", db: "admin" }]
+        });
+        print("admin user created");
+      } catch (e) {
+        print("admin user not created: " + e.codeName);
+      }
+    '
+
+    if ! wait_for "authenticated admin connection" 120 auth_ping_ok; then
+      log "root exists but the password in the Secret does not match; fix auth.adminPassword and reinstall"
+      exit 1
+    fi
+
+    # From here on we are authenticated as root. createUser is idempotent: a
+    # restart hits "UserAlreadyExists" and continues.
+    log "creating application user ${MONGO_APP_USER}"
+    mongosh "${ADMIN_URI}" --quiet --eval '
+      try {
+        db.getSiblingDB("admin").createUser({
+          user: process.env.MONGO_APP_USER,
+          pwd: process.env.MONGO_APP_PASSWORD,
+          roles: [
+            { role: "readWrite", db: process.env.MONGO_DB },
+            { role: "clusterMonitor", db: "admin" }
+          ]
+        });
+        print("app user created");
+      } catch (e) {
+        print("app user not created: " + e.codeName);
+      }
+    '
+
+    log "creating exporter user"
+    mongosh "${ADMIN_URI}" --quiet --eval '
+      try {
+        db.getSiblingDB("admin").createUser({
+          user: "exporter",
+          pwd: process.env.MONGO_EXPORTER_PASSWORD,
+          roles: [
+            { role: "clusterMonitor", db: "admin" },
+            { role: "read", db: process.env.MONGO_DB }
+          ]
+        });
+        print("exporter user created");
+      } catch (e) {
+        print("exporter user not created: " + e.codeName);
+      }
+    '
+
+    APP_URI="mongodb://${MONGO_APP_USER}:${MONGO_APP_PASSWORD}@127.0.0.1:${MONGO_PORT}/${MONGO_DB}?authSource=admin&directConnection=true"
+    if [[ "$(mongosh "${APP_URI}" --quiet \
+      --eval 'db.runCommand({ping:1}).ok' 2>/dev/null | tr -d '\r' | tail -n1)" == "1" ]]; then
+      log "application credentials verified; bootstrap complete"
+    else
+      log "warning: application credentials did not verify; check the Secret"
+    fi
+
+    exec sleep infinity

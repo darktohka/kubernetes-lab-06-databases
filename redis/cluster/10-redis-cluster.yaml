@@ -1,0 +1,42 @@
+# A Redis replication set with Sentinel, managed by the OT Redis operator.
+#
+# The operator watches this object and creates the data Pods (redis-0..2),
+# the Sentinel Pods (redis-s-0..2), the Services redis-master, redis-replica,
+# redis-headless and redis-s-hl, and the PVCs.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-credentials
+type: Opaque
+stringData:
+  password: lab6-redis-password
+---
+apiVersion: redis.redis.opstreelabs.in/v1beta2
+kind: RedisReplication
+metadata:
+  name: redis
+spec:
+  # 3 data nodes: one master and two replicas.
+  clusterSize: 3
+
+  kubernetesConfig:
+    image: quay.io/opstree/redis:v8.10.1
+    redisSecret:
+      name: redis-credentials
+      key: password
+
+  # Sentinel runs next to the data nodes and elects a new master on failure.
+  sentinel:
+    size: 3
+    image: quay.io/opstree/redis-sentinel:v8.10.1
+    redisSecret:
+      name: redis-credentials
+      key: password
+
+  storage:
+    volumeClaimTemplate:
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 512Mi

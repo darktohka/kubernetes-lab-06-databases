@@ -1,0 +1,92 @@
+# A MongoDB replica set managed by the MongoDB Community operator.
+#
+# The operator watches this object and creates the StatefulSet, the headless
+# Service mongodb-svc, the replica set keyfile, and the SCRAM users.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mongodb-credentials
+type: Opaque
+stringData:
+  app-password: lab6-mongodb-password
+  admin-password: lab6-mongodb-admin-password
+---
+# The operator runs its agents with this ServiceAccount. The upstream operator
+# installation only creates it in its own namespace, so every namespace that
+# hosts a MongoDBCommunity needs this small identity.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mongodb-database
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mongodb-database
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mongodb-database
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mongodb-database
+subjects:
+  - kind: ServiceAccount
+    name: mongodb-database
+---
+apiVersion: mongodbcommunity.mongodb.com/v1
+kind: MongoDBCommunity
+metadata:
+  name: mongodb
+spec:
+  # 3 members: one primary and two secondaries.
+  members: 3
+  type: ReplicaSet
+  version: "8.0.34"
+
+  security:
+    authentication:
+      modes: ["SCRAM"]
+
+  users:
+    - name: app
+      db: admin
+      passwordSecretRef:
+        name: mongodb-credentials
+        key: app-password
+      # The operator stores the generated SCRAM credentials in this Secret
+      # (the name is required: without it the operator builds an invalid name).
+      scramCredentialsSecretName: mongodb-app
+      roles:
+        - name: readWrite
+          db: lab6
+        - name: clusterMonitor
+          db: admin
+
+  # One 512Mi data volume and one 512Mi logs volume per member.
+  statefulSet:
+    spec:
+      volumeClaimTemplates:
+        - metadata:
+            name: data-volume
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 512Mi
+        - metadata:
+            name: logs-volume
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 512Mi

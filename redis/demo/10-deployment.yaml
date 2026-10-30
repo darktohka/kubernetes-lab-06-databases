@@ -1,0 +1,66 @@
+# The demo application: a small FastAPI service that reads and writes notes in
+# Redis. It asks Sentinel (redis-s-hl) for the current master on every
+# reconnect, so a failover does not require a configuration change.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-demo
+  labels:
+    app.kubernetes.io/name: redis-demo
+    app.kubernetes.io/part-of: lab06-databases
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis-demo
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis-demo
+        app.kubernetes.io/part-of: lab06-databases
+    spec:
+      containers:
+        - name: app
+          image: lighthouse.tohka.us/example-projects/lab6-redis-demo:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: REDIS_MODE
+              value: sentinel
+            # Headless Service in front of the 3 Sentinel Pods.
+            - name: REDIS_SENTINELS
+              value: redis-s-hl:26379
+            - name: REDIS_MASTER_NAME
+              value: mymaster
+            - name: REDIS_KEY_PREFIX
+              value: "lab06:"
+            - name: REDIS_CACHE_TTL
+              value: "300"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: password
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

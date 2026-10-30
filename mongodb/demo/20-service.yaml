@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-demo
+  labels:
+    app.kubernetes.io/name: mongodb-demo
+    app.kubernetes.io/part-of: lab06-databases
+spec:
+  selector:
+    app.kubernetes.io/name: mongodb-demo
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
